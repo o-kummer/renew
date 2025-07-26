@@ -10,14 +10,16 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.function.Function;
 
+import static de.renew.engine.unify.impl.UnificationContextImpl.*;
+
 public class ComputerImpl implements Computer {
     private static final Object TODO = new Object();
     private static final Object PLANNED = new Object();
-    private final long[] states;
+    private final int[] states;
     private final Object[] valuesAndFunctions;
     private final StructureTypes structureTypes;
 
-    public ComputerImpl(long[] states, Object[] valuesAndFunctions, StructureTypes structureTypes) {
+    public ComputerImpl(int[] states, Object[] valuesAndFunctions, StructureTypes structureTypes) {
         this.states = states;
         this.valuesAndFunctions = valuesAndFunctions;
         this.structureTypes = structureTypes;
@@ -25,26 +27,26 @@ public class ComputerImpl implements Computer {
 
     @Override
     public Binding compute() {
-        Object[] values = new Object[states.length];
+        Object[] values = new Object[valuesAndFunctions.length];
         Arrays.fill(values, TODO);
 
         UnsynchronizedIntStack todo = new UnsynchronizedIntStack();
-        for (int i = 0; i < states.length; i++) {
+        for (int i = 0; i < valuesAndFunctions.length; i++) {
             todo.add(i);
             while (!todo.isEmpty()) {
                 int current = todo.getLast();
                 if (values[current] == TODO) {
                     // Next time the computation will be done. This time the components will be scheduled.
-                    long state = states[current];
-                    int canonicalVariableId = State.stateGetCanonicalVariableId(state);
+                    int baseIndex = STATE_SIZE * current;
+                    int canonicalVariableId = states[baseIndex + CANONICAL_ID_OFFSET_IN_STATE];
                     if (canonicalVariableId == current) {
-                        int typeId = State.stateGetTypeId(state);
-                        if (typeId == State.SIMPLE_TYPE || typeId == State.ELEMENT_TYPE) {
+                        int typeId = states[baseIndex + TYPE_ID_OFFSET_IN_STATE];
+                        if (typeId == SIMPLE_TYPE || typeId == ELEMENT_TYPE) {
                             values[current] = valuesAndFunctions[current];
                             todo.removeLast();
                         } else {
                             values[current] = PLANNED;
-                            int length = State.stateGetLengthOrIndex(state);
+                            int length = states[baseIndex + MISC_OFFSET_IN_STATE] & LENGTH_OR_INDEX_MASK_IN_STATE;
                             for (int j = 0; j < length; j++) {
                                 int elementVariableId = current + 1 + j;
                                 todo.add(elementVariableId);
@@ -56,18 +58,18 @@ public class ComputerImpl implements Computer {
                     }
                 } else if (values[current] == PLANNED) {
                     todo.removeLast();
-                    long state = states[current];
-                    int canonicalVariableId = State.stateGetCanonicalVariableId(state);
+                    int baseIndex = STATE_SIZE * current;
+                    int canonicalVariableId = states[baseIndex + CANONICAL_ID_OFFSET_IN_STATE];
                     if (canonicalVariableId == current) {
                         // A structure or a computation.
-                        int typeId = State.stateGetTypeId(state);
+                        int typeId = states[baseIndex + TYPE_ID_OFFSET_IN_STATE];
                         List<Object> elements = new ArrayList<>();
-                        int length = State.stateGetLengthOrIndex(state);
+                        int length = states[baseIndex + MISC_OFFSET_IN_STATE] & LENGTH_OR_INDEX_MASK_IN_STATE;
                         for (int j = 0; j < length; j++) {
                             elements.add(values[current + 1 + j]);
                         }
 
-                        if (typeId == State.COMPUTATION_TYPE) {
+                        if (typeId == COMPUTATION_TYPE) {
                             @SuppressWarnings("unchecked") Function<List<?>, ?> fun = (Function<List<?>, ?>) valuesAndFunctions[current];
                             values[current] = fun.apply(elements);
                         } else {

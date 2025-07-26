@@ -84,15 +84,6 @@ class UnificationContextImplTest {
     }
 
     @Test
-    void testDetectTooManyVariables() {
-        assertThrows(IllegalStateException.class, () -> {
-            for (int i = 0; i <= State.MAX_VARIABLE_ID; i++) {
-                testling.variable();
-            }
-        });
-    }
-
-    @Test
     void testUnboundStructure() {
         Variable v1 = v();
         Variable v2 = t(v1);

@@ -44,13 +44,36 @@ public class UnificationContextImpl implements UnificationContext {
     private static final int RECORD_SIZE = 2;
     private static final int RECORD_ON_ROLLBACK = 3;
 
+    static final int MISC_OFFSET_IN_STATE = 0;
+    static final int TYPE_ID_OFFSET_IN_STATE = 1;
+    static final int NEXT_ID_OFFSET_IN_STATE = 2;
+    static final int CANONICAL_ID_OFFSET_IN_STATE = 3;
+    static final int STATE_SIZE = 4;
+    static final int MAX_VARIABLE_ID = 0x3fffffff;
+
+    static final int BOUND_MASK_IN_STATE = 0x80000000;
+    static final int COMPUTABLE_MASK_IN_STATE = 0x40000000;
+    static final int LENGTH_OR_INDEX_MASK_IN_STATE = 0x3fffffff;
+
+    static final int SIMPLE_TYPE = 0xffffffff;
+    static final int ELEMENT_TYPE = 0xfffffffe;
+    static final int COMPUTATION_TYPE = 0xfffffffd;
+    static final int STRUCTURE_TYPE_ID_COUNT = 0x7fffffff;
+
     private final StructureTypes structureTypes;
 
     private int maxSize = 256;
     private int size = 0;
 
     /**
-     * Variable states encode according to {@link State}.
+     * Variable states are recorded in groups of 4 integers.
+     *
+     * <ul>
+     *     <li>bits 0..29: length for structures and computations, index for elements; bit 30: bound; bit 31: computable (bound=1 implies computable=1)</li>
+     *     <li>type id for structures; special codes for other kinds of variables</li>
+     *     <li>id of next equivalent variable</li>
+     *     <li>id of canonical variable</li>
+     * </ul>
      * <p>
      * Only update elements of this array in these situations:
      * <ul>
@@ -59,7 +82,7 @@ public class UnificationContextImpl implements UnificationContext {
      *     <li>when undoing a change.</li>
      * </ul>
      */
-    private long[] states = new long[maxSize];
+    private int[] states = new int[STATE_SIZE * maxSize];
 
     /**
      * Access this array for a canonical variable id. It contains:
@@ -82,7 +105,7 @@ public class UnificationContextImpl implements UnificationContext {
        Interpretation of array content (start from the highest index):
        - 0x00000000 + size -> old size given in the lower bits
        - 0x01000000 + variable index -> value was null
-       - 0x02000000 + variable index, high32, low32 -> old state given by the two integers
+       - 0x02000000 + state index, state -> old state entry
        - 0x03000000 -> runnable on rollback was registered
      */
     private int[] history = new int[historyMaxSize];
@@ -112,7 +135,7 @@ public class UnificationContextImpl implements UnificationContext {
     private StructureCursor defaultCursor = new StructureCursor();
 
     public UnificationContextImpl() {
-        this.structureTypes = new StructureTypes(State.STRUCTURE_TYPE_ID_COUNT);
+        this.structureTypes = new StructureTypes(STRUCTURE_TYPE_ID_COUNT);
     }
 
     @Override
@@ -125,13 +148,20 @@ public class UnificationContextImpl implements UnificationContext {
      * in the undo history.
      *
      * @param variableId the variable
+     * @param offset the offset of the state entry
      * @param oldState the known old state
      * @param state the new state
      */
-    private void updateState(int variableId, long oldState, long state) {
-        assert states[variableId] == oldState;
-        recordOldState(variableId, oldState);
-        states[variableId] = state;
+    private void updateState(int variableId, int offset, int oldState, int state) {
+        int index = variableId * STATE_SIZE + offset;
+        assert states[index] == oldState;
+        recordOldState(index, oldState);
+        states[index] = state;
+    }
+
+    private int getState(int variableId, int offset) {
+        int index = variableId * STATE_SIZE + offset;
+        return states[index];
     }
 
     /**
@@ -150,17 +180,36 @@ public class UnificationContextImpl implements UnificationContext {
     /**
      * Return the state of the canonical equivalent of the given variable.
      */
-    private long getState(int variableId) {
-        long state = states[variableId];
-        int canonicalVariableId = State.stateGetCanonicalVariableId(state);
-        if (canonicalVariableId == variableId) {
-            return state;
-        }
-        return states[canonicalVariableId];
+    private int getCanonicalVariableId(int variableId) {
+        return getState(variableId, CANONICAL_ID_OFFSET_IN_STATE);
     }
 
-    private void setNextVariableId(int variableId, long oldState, int nextVariableId) {
-        updateState(variableId, oldState, State.settingNextId(oldState, nextVariableId));
+    private int getMiscForCanonicalVariable(int variableId) {
+        return getState(variableId, MISC_OFFSET_IN_STATE);
+    }
+
+    private int getLengthOrIndexForCanonicalVariable(int variableId) {
+        return getState(variableId, MISC_OFFSET_IN_STATE) & LENGTH_OR_INDEX_MASK_IN_STATE;
+    }
+
+    private boolean isComputableForCanonicalVariable(int variableId) {
+        return (getState(variableId, MISC_OFFSET_IN_STATE) & COMPUTABLE_MASK_IN_STATE) != 0;
+    }
+
+    private boolean isBoundForCanonicalVariable(int variableId) {
+        return (getState(variableId, MISC_OFFSET_IN_STATE) & BOUND_MASK_IN_STATE) != 0;
+    }
+
+    private int getTypeForCanonicalVariable(int variableId) {
+        return getState(variableId, TYPE_ID_OFFSET_IN_STATE);
+    }
+
+    private int getNextIdForCanonicalVariable(int variableId) {
+        return getState(variableId, NEXT_ID_OFFSET_IN_STATE);
+    }
+
+    private void setNextVariableId(int variableId, int oldNextVariableId, int nextVariableId) {
+        updateState(variableId, NEXT_ID_OFFSET_IN_STATE, oldNextVariableId, nextVariableId);
     }
 
     /**
@@ -189,13 +238,13 @@ public class UnificationContextImpl implements UnificationContext {
     private void ensureCapacity(int request) {
         int total = size + request;
         if (total > maxSize) {
-            if (total >= State.MAX_VARIABLE_ID) {
+            if (total >= MAX_VARIABLE_ID) {
                 throw new IllegalStateException("unification too complex");
             }
-            int newMaxSize = Math.min(State.MAX_VARIABLE_ID, Math.max(2 * maxSize, total));
+            int newMaxSize = Math.min(MAX_VARIABLE_ID, Math.max(2 * maxSize, total));
 
-            long[] newStates = new long[newMaxSize];
-            System.arraycopy(states, 0, newStates, 0, size);
+            int[] newStates = new int[STATE_SIZE * newMaxSize];
+            System.arraycopy(states, 0, newStates, 0, STATE_SIZE * size);
             states = newStates;
 
             Object[] newValuesAndFunctions = new Object[newMaxSize];
@@ -241,11 +290,10 @@ public class UnificationContextImpl implements UnificationContext {
         history[historySize++] = (RECORD_NULL_VARIABLE << 24) | variableId;
     }
 
-    private void recordOldState(int variableId, long oldState) {
+    private void recordOldState(int index, int oldState) {
         ensureHistoryCapacity(3);
-        history[historySize++] = (int) oldState;
-        history[historySize++] = (int) (oldState >> 32);
-        history[historySize++] = (RECORD_OLD_STATE << 24) | variableId;
+        history[historySize++] = oldState;
+        history[historySize++] = (RECORD_OLD_STATE << 24) | index;
     }
 
     @Override
@@ -278,8 +326,9 @@ public class UnificationContextImpl implements UnificationContext {
                         break;
                     }
                     case RECORD_OLD_STATE: {
-                        int variableId = operationAndVariable & 0x00ffffff;
-                        readAndRestoreState(variableId);
+                        int index = operationAndVariable & 0x00ffffff;
+                        int oldState = history[--historySize];
+                        states[index] = oldState;
                         break;
                     }
                     case RECORD_ON_ROLLBACK: {
@@ -295,12 +344,6 @@ public class UnificationContextImpl implements UnificationContext {
                         throw new IllegalStateException();
                 }
             }
-        }
-
-        private void readAndRestoreState(int variableId) {
-            long oldState = ((long) history[--historySize]) << 32 & 0xffffffff00000000L |
-                    history[--historySize] & 0x00000000ffffffffL;
-            states[variableId] = oldState;
         }
 
     }
@@ -321,8 +364,7 @@ public class UnificationContextImpl implements UnificationContext {
                 needsOccurrenceCheck.removeLast();
 
                 // Only check the canonical equivalents. If they don't contain cycles, no variable does.
-                long state = states[variableId];
-                int canonicalVariableId = State.stateGetCanonicalVariableId(state);
+                int canonicalVariableId = getCanonicalVariableId(variableId);
                 occurrenceCheckStack.add(canonicalVariableId);
                 if (!occurrenceCheckInternal()) {
                     return false;
@@ -356,21 +398,19 @@ public class UnificationContextImpl implements UnificationContext {
     }
 
     private boolean occurrenceCheckVariable(int variableId) {
-        long state = states[variableId];
-        if (State.stateIsComputable(state)) {
+        if (isComputableForCanonicalVariable(variableId)) {
             // No cycle is possible, because all paths lead to bound values eventually.
             occurrenceCheckComplete.set(variableId);
         } else {
-            int typeId = State.stateGetTypeId(state);
-            boolean isComplex = typeId != State.SIMPLE_TYPE && typeId != State.ELEMENT_TYPE;
+            int typeId = getTypeForCanonicalVariable(variableId);
+            boolean isComplex = typeId != SIMPLE_TYPE && typeId != ELEMENT_TYPE;
             if (isComplex) {
                 occurrenceCheckInProgress.set(variableId);
                 // Process all transitive elements before continuing with this variable.
-                int length = State.stateGetLengthOrIndex(state);
+                int length = getLengthOrIndexForCanonicalVariable(variableId);
                 for (int i = 0; i < length; i++) {
                     int elementVariablesId = variableId + 1 + i;
-                    long elementState = states[elementVariablesId];
-                    int canonicalElementVariableId = State.stateGetCanonicalVariableId(elementState);
+                    int canonicalElementVariableId = getCanonicalVariableId(elementVariablesId);
                     if (occurrenceCheckInProgress.get(canonicalElementVariableId)) {
                         // A cycle was found.
                         return true;
@@ -391,7 +431,11 @@ public class UnificationContextImpl implements UnificationContext {
         ensureCapacity(1);
 
         int variableId = newVariableId(1);
-        states[variableId] = State.state(variableId, variableId, -1, false, false, 0);
+        int baseIndex = STATE_SIZE * variableId;
+        states[baseIndex + MISC_OFFSET_IN_STATE] = 0;
+        states[baseIndex + TYPE_ID_OFFSET_IN_STATE] = SIMPLE_TYPE;
+        states[baseIndex + NEXT_ID_OFFSET_IN_STATE] = variableId;
+        states[baseIndex + CANONICAL_ID_OFFSET_IN_STATE] = variableId;
         return new VariableImpl(this, variableId);
     }
 
@@ -420,7 +464,7 @@ public class UnificationContextImpl implements UnificationContext {
 
     @Override
     public Variable computation(Function<List<?>, ?> fun, List<?> objects) {
-        return insertComplexVariable(State.COMPUTATION_TYPE, fun, objects);
+        return insertComplexVariable(COMPUTATION_TYPE, fun, objects);
     }
 
     private VariableImpl insertComplexVariable(int typeId, Object valueOrFunction, List<?> objects) {
@@ -429,7 +473,7 @@ public class UnificationContextImpl implements UnificationContext {
         int variableId = newVariableId(objects.size() + 1);
         int length = objects.size();
 
-        boolean bound = typeId != State.COMPUTATION_TYPE;
+        boolean bound = typeId != COMPUTATION_TYPE;
         boolean computable = true;
         for (int i = 0; i < length; i++) {
             Object o = objects.get(i);
@@ -437,32 +481,36 @@ public class UnificationContextImpl implements UnificationContext {
 
             if (o instanceof VariableImpl variable) {
                 // The element variable assumes the state of the other variable.
-                long canonicalVariableState = getState(variable.getVariableId());
-                int canonicalVariableId = State.stateGetCanonicalVariableId(canonicalVariableState);
-                setNextVariableId(canonicalVariableId, canonicalVariableState, elementVariableId);
-                boolean elementBound = State.stateIsBound(canonicalVariableState);
-                boolean elementComputable = State.stateIsComputable(canonicalVariableState);
-                states[elementVariableId] = State.state(canonicalVariableId,
-                        State.stateGetNextVariableId(canonicalVariableState),
-                        State.ELEMENT_TYPE,
-                        elementBound,
-                        elementComputable,
-                        i);
+                int canonicalVariableId = getCanonicalVariableId(variable.getVariableId());
+                int nextId = getNextIdForCanonicalVariable(canonicalVariableId);
+                setNextVariableId(canonicalVariableId, nextId, elementVariableId);
+                boolean elementBound = isBoundForCanonicalVariable(canonicalVariableId);
+                boolean elementComputable = isComputable(canonicalVariableId);
+
+                int baseIndex = STATE_SIZE * elementVariableId;
+                states[baseIndex + MISC_OFFSET_IN_STATE] = i | (elementBound ? BOUND_MASK_IN_STATE : 0) | (elementComputable ? COMPUTABLE_MASK_IN_STATE : 0);
+                states[baseIndex + TYPE_ID_OFFSET_IN_STATE] = ELEMENT_TYPE;
+                states[baseIndex + NEXT_ID_OFFSET_IN_STATE] = nextId;
+                states[baseIndex + CANONICAL_ID_OFFSET_IN_STATE] = canonicalVariableId;
+
                 bound &= elementBound;
                 computable &= elementComputable;
             } else {
                 // The element variable is fully bound immediately.
-                states[elementVariableId] = State.state(elementVariableId,
-                        elementVariableId,
-                        State.ELEMENT_TYPE,
-                        true,
-                        true,
-                        i);
+                int baseIndex = STATE_SIZE * elementVariableId;
+                states[baseIndex + MISC_OFFSET_IN_STATE] = i | BOUND_MASK_IN_STATE | COMPUTABLE_MASK_IN_STATE;
+                states[baseIndex + TYPE_ID_OFFSET_IN_STATE] = ELEMENT_TYPE;
+                states[baseIndex + NEXT_ID_OFFSET_IN_STATE] = elementVariableId;
+                states[baseIndex + CANONICAL_ID_OFFSET_IN_STATE] = elementVariableId;
                 updateValueOrFunction(elementVariableId, o);
             }
         }
 
-        states[variableId] = State.state(variableId, variableId, typeId, bound, computable, length);
+        int baseIndex = STATE_SIZE * variableId;
+        states[baseIndex + MISC_OFFSET_IN_STATE] = length | (bound ? BOUND_MASK_IN_STATE : 0) | (computable ? COMPUTABLE_MASK_IN_STATE : 0);
+        states[baseIndex + TYPE_ID_OFFSET_IN_STATE] = typeId;
+        states[baseIndex + NEXT_ID_OFFSET_IN_STATE] = variableId;
+        states[baseIndex + CANONICAL_ID_OFFSET_IN_STATE] = variableId;
         updateValueOrFunction(variableId, valueOrFunction);
         return new VariableImpl(this, variableId);
     }
@@ -498,10 +546,11 @@ public class UnificationContextImpl implements UnificationContext {
     }
 
     private boolean unifyVariableAndObject(int variableId, Object o) {
-        long state = getState(variableId);
-        int canonicalVariableId = State.stateGetCanonicalVariableId(state);
-        if (State.stateIsComputable(state)) {
-            if (!State.stateIsBound(state)) {
+        int canonicalVariableId = getCanonicalVariableId(variableId);
+        boolean bound = isBoundForCanonicalVariable(canonicalVariableId);
+        boolean computable = isComputableForCanonicalVariable(canonicalVariableId);
+        if (computable) {
+            if (!bound) {
                 // A variable that is computable and not bound contains a reference to a computation.
                 // Such a variable is never unifiable with an exact value.
                 return false;
@@ -509,11 +558,11 @@ public class UnificationContextImpl implements UnificationContext {
             Object value = getValue(canonicalVariableId);
             return Objects.equals(value, o);
         }
-        int typeId = State.stateGetTypeId(state);
-        if (typeId == State.SIMPLE_TYPE || typeId == State.ELEMENT_TYPE) {
+        int typeId = getTypeForCanonicalVariable(canonicalVariableId);
+        if (typeId == SIMPLE_TYPE || typeId == ELEMENT_TYPE) {
             return assignVariable(canonicalVariableId, o);
         }
-        if (typeId == State.COMPUTATION_TYPE) {
+        if (typeId == COMPUTATION_TYPE) {
             return false;
         }
         // A structure.
@@ -524,7 +573,7 @@ public class UnificationContextImpl implements UnificationContext {
         if (!type.canHandle(o.getClass())) {
             return false;
         }
-        int length = State.stateGetLengthOrIndex(state);
+        int length = getLengthOrIndexForCanonicalVariable(canonicalVariableId);
         if (length != type.length(o)) {
             return false;
         }
@@ -551,13 +600,13 @@ public class UnificationContextImpl implements UnificationContext {
     private boolean processToMarkBound() {
         while (!toMarkBound.isEmpty()) {
             int canonicalVariableId = toMarkBound.getLast();
+            int oldMisc = getMiscForCanonicalVariable(canonicalVariableId);
             toMarkBound.removeLast();
-            long canonicalState = states[canonicalVariableId];
-            if (State.stateIsComputable(canonicalState)) {
+            if ((oldMisc & COMPUTABLE_MASK_IN_STATE) != 0) {
                 // This equivalence class has already been processed.
                 break;
             }
-            updateState(canonicalVariableId, canonicalState, canonicalState | State.BOUND_MASK_IN_STATE | State.COMPUTABLE_MASK_IN_STATE);
+            updateState(canonicalVariableId, MISC_OFFSET_IN_STATE, oldMisc, oldMisc | BOUND_MASK_IN_STATE | COMPUTABLE_MASK_IN_STATE);
             boolean valueIsKnown = false;
             Object value = null;
 
@@ -575,15 +624,13 @@ public class UnificationContextImpl implements UnificationContext {
     private boolean processToMarkBoundAllEquivalents(int canonicalVariableId, boolean valueIsKnown, Object value) {
         int current = canonicalVariableId;
         do {
-            long state = states[current];
-            if (State.stateIsElement(state)) {
-                int index = State.stateGetLengthOrIndex(state);
+            if (getTypeForCanonicalVariable(current) == ELEMENT_TYPE) {
+                int index = getLengthOrIndexForCanonicalVariable(current);
 
                 int aggregateVariableId = current - 1 - index;
-                long aggregateVariableState = getState(aggregateVariableId);
-                int canonicalAggregateVariableId = State.stateGetCanonicalVariableId(aggregateVariableState);
-                int aggregateVariableTypeId = State.stateGetTypeId(aggregateVariableState);
-                boolean isStructure = State.COMPUTATION_TYPE != aggregateVariableTypeId;
+                int canonicalAggregateVariableId = getCanonicalVariableId(aggregateVariableId);
+                int aggregateVariableTypeId = getTypeForCanonicalVariable(canonicalAggregateVariableId);
+                boolean isStructure = aggregateVariableTypeId != COMPUTATION_TYPE;
                 if (isStructure) {
                     StructureType aggregateVariableType = structureTypes.getType(aggregateVariableTypeId);
                     if (!valueIsKnown) {
@@ -594,14 +641,15 @@ public class UnificationContextImpl implements UnificationContext {
                         return false;
                     }
                 }
-                int length = State.stateGetLengthOrIndex(aggregateVariableState);
+                int length = getLengthOrIndexForCanonicalVariable(canonicalAggregateVariableId);
                 boolean isAggregateBound = isStructure;
                 boolean isAggregateComputable = true;
                 for (int i = 0; i < length; i++) {
                     int elementVariableId = canonicalAggregateVariableId + 1 + i;
-                    long elementState = getState(elementVariableId);
-                    isAggregateComputable &= State.stateIsComputable(elementState);
-                    isAggregateBound &= State.stateIsBound(elementState);
+                    int canonicalElementVariableId = getCanonicalVariableId(elementVariableId);
+                    int elementMisc = getMiscForCanonicalVariable(canonicalElementVariableId);
+                    isAggregateComputable &= (elementMisc & COMPUTABLE_MASK_IN_STATE) != 0;
+                    isAggregateBound &= (elementMisc & BOUND_MASK_IN_STATE) != 0;
                 }
                 if (isAggregateBound) {
                     toMarkBound.add(canonicalAggregateVariableId);
@@ -609,7 +657,7 @@ public class UnificationContextImpl implements UnificationContext {
                     toMarkComputable.add(canonicalAggregateVariableId);
                 }
             }
-            current = State.stateGetNextVariableId(state);
+            current = getNextIdForCanonicalVariable(current);
         } while (current != canonicalVariableId);
         return true;
     }
@@ -618,12 +666,12 @@ public class UnificationContextImpl implements UnificationContext {
         while (!toMarkComputable.isEmpty()) {
             int canonicalVariableId = toMarkComputable.getLast();
             toMarkComputable.removeLast();
-            long canonicalState = states[canonicalVariableId];
-            if (State.stateIsComputable(canonicalState)) {
+            int misc = getMiscForCanonicalVariable(canonicalVariableId);
+            if ((misc & COMPUTABLE_MASK_IN_STATE) != 0) {
                 // This equivalence class has already been processed.
                 break;
             }
-            updateState(canonicalVariableId, canonicalState, canonicalState | State.COMPUTABLE_MASK_IN_STATE);
+            updateState(canonicalVariableId, MISC_OFFSET_IN_STATE, misc, misc | COMPUTABLE_MASK_IN_STATE);
 
             processToMarkComputableAllEquivalents(canonicalVariableId);
         }
@@ -635,29 +683,28 @@ public class UnificationContextImpl implements UnificationContext {
     private void processToMarkComputableAllEquivalents(int canonicalVariableId) {
         int current = canonicalVariableId;
         do {
-            long state = states[current];
-            if (State.stateIsElement(state)) {
-                int index = State.stateGetLengthOrIndex(state);
+            if (getTypeForCanonicalVariable(current) == ELEMENT_TYPE) {
+                int index = getLengthOrIndexForCanonicalVariable(current);
                 int aggregateVariableId = current - 1 - index;
-                long aggregateVariableState = getState(aggregateVariableId);
-                int canonicalAggregateVariableId = State.stateGetCanonicalVariableId(aggregateVariableState);
-                int length = State.stateGetLengthOrIndex(aggregateVariableState);
+                int canonicalAggregateVariableId = getCanonicalVariableId(aggregateVariableId);
+                int length = getLengthOrIndexForCanonicalVariable(canonicalAggregateVariableId);
                 if (isAggregateComputable(length, canonicalAggregateVariableId)) {
                     toMarkComputable.add(canonicalAggregateVariableId);
                 }
             }
-            current = State.stateGetNextVariableId(state);
+            current = getNextIdForCanonicalVariable(current);
         } while (current != canonicalVariableId);
     }
 
     private boolean isAggregateComputable(int length, int canonicalAggregateVariableId) {
-        boolean isAggregateComputable = true;
         for (int i = 0; i < length; i++) {
             int elementVariableId = canonicalAggregateVariableId + 1 + i;
-            long elementState = getState(elementVariableId);
-            isAggregateComputable &= State.stateIsComputable(elementState);
+            int canonicalElementVariableId = getCanonicalVariableId(elementVariableId);
+            if (!isComputableForCanonicalVariable(canonicalElementVariableId)) {
+                return false;
+            }
         }
-        return isAggregateComputable;
+        return true;
     }
 
     private boolean unifyVariablesAtomically(int variableId1, int variableId2) {
@@ -673,8 +720,8 @@ public class UnificationContextImpl implements UnificationContext {
     }
 
     private boolean unifyVariables(int variableId1, int variableId2) {
-        int canonicalVariableId1 = State.stateGetCanonicalVariableId(states[variableId1]);
-        int canonicalVariableId2 = State.stateGetCanonicalVariableId(states[variableId2]);
+        int canonicalVariableId1 = getCanonicalVariableId(variableId1);
+        int canonicalVariableId2 = getCanonicalVariableId(variableId2);
         if (canonicalVariableId1 == canonicalVariableId2) {
             return true;
         }
@@ -682,23 +729,23 @@ public class UnificationContextImpl implements UnificationContext {
     }
 
     private boolean unifyCanonicalVariables(int canonicalVariableId1, int canonicalVariableId2) {
-        long state1 = states[canonicalVariableId1];
-        if (State.stateIsBound(state1)) {
+        int misc1 = getMiscForCanonicalVariable(canonicalVariableId1);
+        if ((misc1 & BOUND_MASK_IN_STATE) != 0) {
             return unifyVariableAndObject(canonicalVariableId2, getValue(canonicalVariableId1));
         }
-        long state2 = states[canonicalVariableId2];
-        if (State.stateIsBound(state2)) {
+        int misc2 = getMiscForCanonicalVariable(canonicalVariableId2);
+        if ((misc2 & BOUND_MASK_IN_STATE) != 0) {
             return unifyVariableAndObject(canonicalVariableId1, getValue(canonicalVariableId2));
         }
 
-        int typeId1 = State.stateGetTypeId(state1);
-        int typeId2 = State.stateGetTypeId(state2);
-        boolean isComplex1 = typeId1 != State.SIMPLE_TYPE && typeId1 != State.ELEMENT_TYPE;
-        boolean isComplex2 = typeId2 != State.SIMPLE_TYPE && typeId2 != State.ELEMENT_TYPE;
+        int typeId1 = getTypeForCanonicalVariable(canonicalVariableId1);
+        int typeId2 = getTypeForCanonicalVariable(canonicalVariableId2);
+        boolean isComplex1 = typeId1 != SIMPLE_TYPE && typeId1 != ELEMENT_TYPE;
+        boolean isComplex2 = typeId2 != SIMPLE_TYPE && typeId2 != ELEMENT_TYPE;
 
         if (isComplex1) {
             if (isComplex2) {
-                if (!unifyComplexVariables(canonicalVariableId1, canonicalVariableId2, typeId1, typeId2, state1, state2)) {
+                if (!unifyComplexVariables(canonicalVariableId1, canonicalVariableId2, typeId1, typeId2, misc1, misc2)) {
                     return false;
                 }
             } else {
@@ -714,18 +761,18 @@ public class UnificationContextImpl implements UnificationContext {
         return true;
     }
 
-    private boolean unifyComplexVariables(int canonicalVariableId1, int canonicalVariableId2, int typeId1, int typeId2, long state1, long state2) {
+    private boolean unifyComplexVariables(int canonicalVariableId1, int canonicalVariableId2, int typeId1, int typeId2, int misc1, int misc2) {
         if (typeId1 != typeId2) {
             // Two different complex types cannot be unified.
             return false;
         }
-        if (typeId1 == State.COMPUTATION_TYPE) {
+        if (typeId1 == COMPUTATION_TYPE) {
             // Two different computations cannot be unified.
             return false;
         }
         // Two structures of the same type.
-        int length1 = State.stateGetLengthOrIndex(state1);
-        int length2 = State.stateGetLengthOrIndex(state2);
+        int length1 = misc1 & LENGTH_OR_INDEX_MASK_IN_STATE;
+        int length2 = misc2 & LENGTH_OR_INDEX_MASK_IN_STATE;
         if (length1 != length2) {
             // Two structures of different length cannot be unified.
             return false;
@@ -757,49 +804,49 @@ public class UnificationContextImpl implements UnificationContext {
      * @param canonicalVariableId the canonical variable that the variable will defer to
      */
     private void assumeCanonicalVariableId(int variableId, int canonicalVariableId) {
+        int oldCanonicalVariableId = getCanonicalVariableId(variableId);
         int current = variableId;
         do {
-            long state = states[current];
-            updateState(current, state, State.settingCanonicalId(state, canonicalVariableId));
-            current = State.stateGetNextVariableId(state);
+            updateState(current, CANONICAL_ID_OFFSET_IN_STATE, oldCanonicalVariableId, canonicalVariableId);
+            current = getNextIdForCanonicalVariable(current);
         } while (current != variableId);
-        long state = states[variableId];
-        long replacementState = states[canonicalVariableId];
-        setNextVariableId(variableId, state, State.stateGetNextVariableId(replacementState));
-        setNextVariableId(canonicalVariableId, replacementState, State.stateGetNextVariableId(state));
+        int nextId1 = getNextIdForCanonicalVariable(variableId);
+        int nextId2 = getNextIdForCanonicalVariable(canonicalVariableId);
+        setNextVariableId(variableId, nextId1, nextId2);
+        setNextVariableId(canonicalVariableId, nextId2, nextId1);
     }
 
 
     @Override
     public Computer getComputer() {
-        long[] clonedStates = new long[size];
-        System.arraycopy(states, 0, clonedStates, 0, size);
+        int[] clonedStates = new int[STATE_SIZE * size];
+        System.arraycopy(states, 0, clonedStates, 0, STATE_SIZE * size);
         Object[] clonedValuesAndFunctions = new Object[size];
         System.arraycopy(valuesAndFunctions, 0, clonedValuesAndFunctions, 0, size);
         return new ComputerImpl(clonedStates, clonedValuesAndFunctions, structureTypes);
     }
 
     boolean isBound(int variableId) {
-        int canonicalVariableId = State.stateGetCanonicalVariableId(states[variableId]);
-        return State.stateIsBound(states[canonicalVariableId]);
+        int canonicalVariableId = getCanonicalVariableId(variableId);
+        return isBoundForCanonicalVariable(canonicalVariableId);
     }
 
     boolean isComputable(int variableId) {
-        int canonicalVariableId = State.stateGetCanonicalVariableId(states[variableId]);
-        return State.stateIsComputable(states[canonicalVariableId]);
+        int canonicalVariableId = getCanonicalVariableId(variableId);
+        return isComputableForCanonicalVariable(canonicalVariableId);
     }
 
     Object getValue(int variableId) {
-        int canonicalVariableId = State.stateGetCanonicalVariableId(states[variableId]);
-        long state = states[canonicalVariableId];
-        if (!State.stateIsBound(state)) {
+        int canonicalVariableId = getCanonicalVariableId(variableId);
+        int misc = getMiscForCanonicalVariable(canonicalVariableId);
+        if ((misc & BOUND_MASK_IN_STATE) == 0) {
             throw new IllegalStateException("variable is not bound");
         }
-        int typeId = State.stateGetTypeId(state);
-        if (typeId == State.SIMPLE_TYPE || typeId == State.ELEMENT_TYPE) {
+        int typeId = getTypeForCanonicalVariable(canonicalVariableId);
+        if (typeId == SIMPLE_TYPE || typeId == ELEMENT_TYPE) {
             return valuesAndFunctions[canonicalVariableId];
         } else {
-            int length = State.stateGetLengthOrIndex(state);
+            int length = misc & LENGTH_OR_INDEX_MASK_IN_STATE;
             StructureType type = structureTypes.getType(typeId);
             List<Object> elements = new ArrayList<>();
             for (int i = 0; i < length; i++) {
@@ -831,9 +878,9 @@ public class UnificationContextImpl implements UnificationContext {
     }
 
     private void guide(StructureCursor cursor, StructureVisitor visitor, int variableId, boolean passValue) {
-        int canonicalVariableId = State.stateGetCanonicalVariableId(states[variableId]);
-        long state = states[canonicalVariableId];
-        if (State.stateIsBound(state)) {
+        int canonicalVariableId = getCanonicalVariableId(variableId);
+        int misc = getMiscForCanonicalVariable(canonicalVariableId);
+        if ((misc & BOUND_MASK_IN_STATE) != 0) {
             if (passValue) {
                 Object value = getValue(variableId);
                 long valueHash = StructureGuide.longHash(structureTypes, value);
@@ -842,9 +889,9 @@ public class UnificationContextImpl implements UnificationContext {
                 visitor.visit(cursor, null, longHash(variableId));
             }
         } else {
-            int typeId = State.stateGetTypeId(state);
-            if (typeId < State.STRUCTURE_TYPE_ID_COUNT) {
-                int length = State.stateGetLengthOrIndex(state);
+            int typeId = getTypeForCanonicalVariable(canonicalVariableId);
+            if (typeId >= 0 && typeId < STRUCTURE_TYPE_ID_COUNT) {
+                int length = misc & LENGTH_OR_INDEX_MASK_IN_STATE;
                 for (int i = 0; i < length; i++) {
                     cursor.enter(typeId, length, i);
                     try {
@@ -863,11 +910,10 @@ public class UnificationContextImpl implements UnificationContext {
      * @param variableId the id of the variable
      */
     private long longHash(int variableId) {
-        int canonicalVariableId = State.stateGetCanonicalVariableId(states[variableId]);
-        long state = states[canonicalVariableId];
-        int typeId = State.stateGetTypeId(state);
-        if (typeId < State.STRUCTURE_TYPE_ID_COUNT) {
-            int length = State.stateGetLengthOrIndex(state);
+        int canonicalVariableId = getCanonicalVariableId(variableId);
+        int typeId = getTypeForCanonicalVariable(canonicalVariableId);
+        if (typeId >= 0 && typeId < STRUCTURE_TYPE_ID_COUNT) {
+            int length = getLengthOrIndexForCanonicalVariable(canonicalVariableId);
             long hash = LongHashUtil.baseStructureHash(typeId, length);
             for (int i = 0; i < length; i++) {
                 long elementHash = longHash(canonicalVariableId + 1 + i);
@@ -883,12 +929,11 @@ public class UnificationContextImpl implements UnificationContext {
     public void dump() {
         System.out.println("V  C N T I/L bound computable");
         for (int i = 0; i < this.size; i++) {
-            long state = states[i];
-            int typeId = State.stateGetTypeId(state);
-            String prefix = typeId == State.ELEMENT_TYPE ? " " : "";
-            String infix = typeId == State.ELEMENT_TYPE ? "" : " ";
-            System.out.printf("%s%d%s %d %d %d %d %s %s%n", prefix, i, infix, State.stateGetCanonicalVariableId(state), State.stateGetNextVariableId(state),
-                    typeId, State.stateGetLengthOrIndex(state), State.stateIsBound(state), State.stateIsComputable(state));
+            int typeId = getTypeForCanonicalVariable(i);
+            String prefix = typeId == ELEMENT_TYPE ? " " : "";
+            String infix = typeId == ELEMENT_TYPE ? "" : " ";
+            System.out.printf("%s%d%s %d %d %d %d %s %s%n", prefix, i, infix, getCanonicalVariableId(i), getNextIdForCanonicalVariable(i),
+                    typeId, getLengthOrIndexForCanonicalVariable(i), isBoundForCanonicalVariable(i), isComputableForCanonicalVariable(i));
         }
         System.out.println();
     }

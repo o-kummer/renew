@@ -10,6 +10,7 @@ import org.junit.jupiter.api.Assertions;
 // attempt 1: 1.51µs
 // 2024-07-30, full-featured: 0.63µs
 // 2024-08-17, refactored: 0.68µs
+// 2025-07-26, converted to int state array: 0.63µs
 public class Benchmark {
 
     public static final long WARMUP_TIME_MS = 2000L;
